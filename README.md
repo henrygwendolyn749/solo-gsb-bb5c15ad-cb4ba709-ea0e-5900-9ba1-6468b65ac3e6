@@ -1,6 +1,6 @@
 # Live Subtitle Finalizer — 直播字幕定稿服务
 
-基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择；需要一次改多处时还可调用**批量更正接口**：单事务内逐项核对、全部通过才按输入顺序追加，任一项失败整批零写入，并以频道范围内的幂等键支持安全重试。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
+基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择；需要一次改多处时还可调用**批量更正接口**：单事务内逐项核对、全部通过才按输入顺序追加，任一项失败整批零写入，并以频道范围内的幂等键支持安全重试。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。快照内容如需脱敏外发，可调用**快照敏感词遮盖**：对冻结的生效文本按词表逐码点精确遮盖（相邻字幕无分隔拼接、缺口阻断、命中码点替换为 `*`），纯只读计算、先按完整快照遮盖再分页返回，跨页词语同样完整遮盖。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
 
 ## 语义规则
 
@@ -50,6 +50,13 @@
 - 差异基于快照**冻结的生效内容**：字幕以生效文本与 `correction_version` 判定，缺口以裁决区间端点判定；两侧完全一致的序号不返回。
 - 两份快照按 `seq` 升序合并，差异分 `added` / `removed` / `changed` 三类；`limit` 只计差异条目，`next_after` 指向本页最后一条差异，稀疏差异不会漏项。
 
+### 快照敏感词遮盖规则
+
+- 接口 `POST /snapshots/{snapshot_id}/redactions` 接收词表 `words`、`after`（序号游标，默认 0）与 `limit`（1～100，默认 100）；词表**去重后须为 1～20 项**，每项 **1～128 个 Unicode 码点**，非法参数返回 422，快照不存在返回 404。
+- 遮盖基于快照**冻结的生效文本**（与 `view=effective` 一致）：相邻字幕按序号**无分隔拼接**，跨序号的词语同样命中；**缺口标记阻断拼接**，跨缺口的词语永不命中。
+- 匹配**区分大小写、逐码点精确、不做任何归一化**；枚举所有词的**重叠命中**并取覆盖区间**并集**，每个被覆盖码点恰好替换为一个 `*`，再按原序号拆回各条目；未命中文字与缺口标记原样保留。
+- 纯只读计算：不修改快照，也不影响当前字幕；**先按完整快照计算遮盖，再返回 `after` 之后至多 `limit` 条**，跨页边界的词语同样完整遮盖；有后续条目时 `next_after` 为本页末序号，否则为 `null`。
+
 ### 命名消费者拉取游标规则
 
 - 每个 `(channel, consumer)` 维护独立的已确认游标 `cursor`（初始 0）与至多一个未过期租约；消费者之间互不影响。
@@ -78,6 +85,7 @@ docker compose up --build
 - 分页拉取快照（`view=original|effective`）：`GET /snapshots/{snapshot_id}/items`
 - 快照内更正历史（版本升序）：`GET /snapshots/{snapshot_id}/items/{seq}/corrections`
 - 比较两个快照的差异：`GET /snapshots/{snapshot_id}/diff?other={other_id}`
+- 快照敏感词遮盖（只读分页）：`POST /snapshots/{snapshot_id}/redactions`
 - 领取消费者批次：`POST /channels/{channel}/consumers/{consumer}/claims`
 - 确认消费者批次：`POST /channels/{channel}/consumers/{consumer}/acks`
 - 查询消费者状态：`GET /channels/{channel}/consumers/{consumer}`
@@ -513,6 +521,46 @@ curl 'http://localhost:8000/snapshots/b1f3c2a4-..../diff?other=c2e4d5b6-....&aft
 | 409    | `snapshot_channel_mismatch`  | 两个快照分属不同频道，不能比较             |
 | 422    | —                            | 缺少 `other`、`after<0` 或 `limit` 越界    |
 
+### 快照敏感词遮盖（只读分页）
+
+对快照冻结的生效文本按敏感词表做逐码点遮盖，供脱敏外发场景分页拉取。**纯只读计算**：不修改快照，也不影响当前字幕。
+
+```bash
+curl -X POST http://localhost:8000/snapshots/b1f3c2a4-..../redactions \
+  -H 'Content-Type: application/json' \
+  -d '{"words": ["秘密", "内部"], "after": 0, "limit": 100}'
+```
+
+```json
+{
+  "snapshot_id": "b1f3c2a4-....",
+  "channel": "news",
+  "watermark": 6,
+  "words": ["秘密", "内部"],
+  "items": [
+    {"kind": "subtitle", "seq": 1, "revision": 1, "text": "第一条**字幕", "start_seq": null, "end_seq": null},
+    {"kind": "gap",      "seq": 3, "revision": null, "text": null, "start_seq": 3, "end_seq": 4}
+  ],
+  "next_after": null
+}
+```
+
+请求字段与遮盖规则：
+
+- `words`（必填）：敏感词表。**去重后须为 1～20 项**（重复项按首次出现保留一项），每项 **1～128 个 Unicode 码点**；响应中的 `words` 为实际参与遮盖的去重词表；
+- `after`（默认 0）：序号游标，只返回序号大于该值的条目（字幕与缺口标记统一计数）；`limit`（默认 100，1～100）：本页最多返回的条目数；
+- 遮盖基于快照**冻结的生效文本**：相邻字幕按序号**无分隔拼接**后再匹配，跨序号（含跨页）的词语完整命中；**缺口标记阻断拼接**，跨缺口的词语永不命中；
+- 匹配**区分大小写、逐码点精确、不做归一化**；所有词的**重叠命中**取覆盖区间并集，每个被覆盖码点替换为一个 `*`，再按原序号拆回；未命中文字与缺口标记原样保留；
+- **先按完整快照计算遮盖，再截取分页**：即使某个词恰好跨在两页边界上，两页中的部分也都被完整遮盖；
+- `next_after`：本页之后仍有条目时为本页末序号，以其作为下一页的 `after` 续拉；没有更多条目时为 `null`。
+
+错误：
+
+| 状态码 | `error`              | 含义                                                                 |
+| ------ | -------------------- | -------------------------------------------------------------------- |
+| 404    | `snapshot_not_found` | 快照不存在                                                           |
+| 422    | —                    | 缺少 `words`、词表去重后非 1～20 项、词长越界、`after<0`、`limit` 越界 |
+
 ### 领取消费者批次（claim）
 
 命名消费者从自己的已确认游标后领取连续批次，服务在同一事务内签发带过期时间的租约令牌：
@@ -593,7 +641,7 @@ curl http://localhost:8000/channels/news/consumers/worker-1
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、单条/批量更正、批量整批拒绝/幂等重试/并发、版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、消费者领取/确认/租约过期/并发、并发事务等用例
+pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、单条/批量更正、批量整批拒绝/幂等重试/并发、版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、快照敏感词遮盖拼接/缺口阻断/重叠并集/分页/校验、消费者领取/确认/租约过期/并发、并发事务等用例
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -608,6 +656,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **批量更正**：`correction_batches(batch_id, channel, idempotency_key, request_fingerprint, created_at)` 以 `UNIQUE(channel, idempotency_key)` 约束频道内幂等键；`correction_batch_items(batch_id, item_index, seq, expected_version, correction_version, text, reason, created_at)` 按输入顺序（`item_index` 从 0 起）冻结逐项请求与结果，供重试逐字重放。`submit_correction_batch` 在单个 `BEGIN IMMEDIATE` 事务内先查幂等键——命中且指纹（逐项 seq/expected_version/text/reason 及顺序的 SHA-256）一致则只读重放原批次，键相同指纹不同抛 `idempotency_key_conflict`；未命中时逐项核对批内重复 seq（重复出现项标 `duplicate_seq`）、定稿存在性（`not_finalized` / `seq_is_gap`）与当前版本（`version_conflict`），冲突按输入顺序全部收集后一次性抛 `batch_conflict` 并随事务回滚，做到**零写入**；全部通过才先插入批次行（唯一约束是并发同键重试的最后防线），再按输入顺序逐项 `INSERT ... RETURNING created_at` 追加 `corrections` 版本并写入冻结记录，与单条更正共用同一版本链。两张批次表均配 `no_update` / `no_delete` 触发器，幂等记录在存储层不可变。
 - **发布快照**：`snapshots(snapshot_id, channel, watermark, idempotency_key, created_at)` 记录冻结时刻，`snapshot_items(snapshot_id, seq, …)` 对 `1..watermark` 每个序号落一行——字幕行同时存 `original_text`、创建时刻经 `MAX(version)` 连接冻结的 `effective_text` 及其 `correction_version`，缺口行存裁决区间端点；`snapshot_corrections(snapshot_id, seq, version, …)` 逐版本复制快照时刻已有的全部更正记录。创建先按 `(channel, idempotency_key)` 查重，命中即幂等返回；全部插入在一个写事务内完成，故冻结视图与锁定水位线严格一致。三张快照表各自配备 `no_update` / `no_delete` 触发器，快照一旦生成在存储层即不可变；分页与快照内审计只读取快照表，后续定稿、更正、缺口对其零影响。不存在的频道不写 `channels` 行，直接生成 `watermark=0` 的空快照。
 - **快照差异**：`GET /snapshots/{snapshot_id}/diff?other=…` 在单个只读事务内校验两快照存在且同频道（不存在 404、跨频道 409），随后用两段 `LEFT JOIN` 的 `UNION ALL` 模拟全外连接，把两份 `snapshot_items` 按 `seq` 合并：第一段覆盖“基准有 / 双方都有且有差异”，第二段补齐“仅对方有”。差异判定用 SQLite 的 NULL 安全不等号 `IS NOT` 比较冻结的 `effective_text`、`correction_version`（字幕）与 `start_seq` / `end_seq`（缺口），完全一致的行在 SQL 层即被过滤，`ORDER BY seq LIMIT` 只作用于差异行——因此 `limit` 天然只计差异条目，稀疏差异也不会漏项；`next_after` 取本页最后一条差异的 `seq` 供续拉。
+- **快照敏感词遮盖**：`POST /snapshots/{snapshot_id}/redactions` 在只读事务内取出完整快照（`1..watermark`）的冻结条目，其余计算全部在内存中完成、零写入。相邻字幕的 `effective_text` 按 seq 无分隔拼接成段（缺口行切段，跨缺口的词永不命中），段内用 `str.find` 逐码点枚举每个词的全部重叠命中（区分大小写、不做归一化，每次命中后从起点 +1 继续），命中区间的并集以布尔数组标记后逐码点替换为 `*`，再按各字幕原码点长度拆回。遮盖先对完整快照计算完毕，再截取 `after` 之后至多 `limit` 条返回，跨页边界的词语因此完整遮盖；`next_after` 在本页之后仍有条目时取本页末序号，否则为 `null`。词表在 schema 层去重并校验（1～20 项、每项 1～128 码点），非法请求返回 422，快照不存在返回 404。
 - **命名消费者拉取游标**：`consumers(channel, consumer, cursor, lease_token, lease_from, lease_to, lease_expires_at, …)` 每消费者一行。领取在单个 `BEGIN IMMEDIATE` 事务内「注册消费者 → 校验无未过期租约 → 复用定稿查询截取 `cursor` 后的连续批次（含缺口标记）→ 写入新租约（UUID 令牌 + 过期时刻 epoch 秒）」，并发领取同一消费者只有一个能拿到租约；确认同样单事务完成全部校验（游标一致 → 有租约 → 令牌匹配 → 未过期 → `new_cursor` 在批次范围内）后推进游标并清空租约，任何一步失败都不改写状态。租约过期由应用层按 `lease_expires_at` 判定，过期后同一未确认批次可被重新领取并签发新令牌（旧令牌随之失效），确认成功即清空租约、下一批从新游标继续，实现至少一次交付。
 - **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`correction_batches` / `correction_batch_items`（批量更正批次与逐项冻结记录，不可变）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）、`consumers`（命名消费者拉取游标）十二张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
 - **容器化**：`docker compose up --build` 一键启动，数据库落在命名卷 `subtitles-data`；服务固定监听 **8000** 端口。

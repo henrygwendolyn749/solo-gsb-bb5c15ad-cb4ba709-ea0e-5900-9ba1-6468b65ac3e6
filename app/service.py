@@ -51,6 +51,16 @@
   只计差异条目，next_after 指向本页最后一条差异的 seq，稀疏差异
   也不会因中间大量未变化条目而漏项。
 
+快照敏感词遮盖（redact_snapshot）不变式：
+- 纯只读计算：只读取快照表，快照与当前字幕在任何情况下都不被修改；
+- 遮盖基于快照冻结的生效文本（effective_text）：相邻字幕按序号无分隔
+  拼接，缺口行阻断拼接（跨缺口的词永不命中）；匹配区分大小写、逐码点
+  精确、不做归一化；所有词的重叠命中取覆盖区间并集，每个被覆盖码点
+  恰好替换为一个 *，再按原序号拆回，未命中文字与缺口标记原样保留；
+- 遮盖始终先按完整快照（1..watermark）计算，再截取 after 之后至多
+  limit 条返回，跨页边界的词语同样完整遮盖；本页之后仍有条目时
+  next_after 为本页末序号，否则为 null。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1238,6 +1248,112 @@ def _diff_side_item(row, side: str):
         "end_seq": None,
         "correction_version": row[f"{side}_correction_version"],
     }
+
+
+# ---------- 快照敏感词遮盖 ----------
+
+
+def redact_snapshot(
+    snapshot_id: str, words: list, after: int = 0, limit: int = 100
+) -> dict:
+    """对快照冻结的生效文本做敏感词遮盖，返回 after 之后至多 limit 条。
+
+    纯只读计算，快照表与原字幕表均不被修改：先取出完整快照（1..watermark）
+    的全部条目，把相邻字幕的冻结生效文本按序号无分隔拼接（缺口行阻断
+    拼接，跨缺口的词永不命中），在拼接文本上枚举所有词的重叠命中、取
+    覆盖区间并集，逐码点替换为 * 后按原序号拆回；未命中文字与缺口标记
+    原样保留。分页在完整快照的遮盖计算之后进行，因此跨页边界的词语也
+    被完整遮盖。
+    """
+    with read_tx() as conn:
+        meta = _get_snapshot_meta(conn, snapshot_id)
+        channel, watermark = meta["channel"], meta["watermark"]
+        rows = conn.execute(
+            "SELECT seq, kind, revision, effective_text, start_seq, end_seq "
+            "FROM snapshot_items WHERE snapshot_id = ? ORDER BY seq",
+            (snapshot_id,),
+        ).fetchall()
+
+    items = _redact_snapshot_items(rows, words)
+    page = [item for item in items if item["seq"] > after][:limit]
+    has_more = bool(page) and items[-1]["seq"] > page[-1]["seq"]
+    return {
+        "snapshot_id": snapshot_id,
+        "channel": channel,
+        "watermark": watermark,
+        "words": list(words),
+        "items": page,
+        "next_after": page[-1]["seq"] if has_more else None,
+    }
+
+
+def _redact_snapshot_items(rows, words: list) -> list:
+    """把快照条目按“相邻字幕段”拼接遮盖后拆回，返回完整条目列表（seq 升序）。
+
+    相邻字幕段 = 连续的字幕行（中间没有缺口行）；段内文本无分隔拼接，
+    命中区间的并集逐码点替换为 * 后按原长度拆回各序号。缺口行不参与
+    拼接（阻断跨缺口命中），其标记原样保留。
+    """
+    items = []
+    segment = []  # 当前段的 (items 下标, 原文码点数)
+
+    def flush_segment():
+        if not segment:
+            return
+        joined = "".join(items[idx]["text"] for idx, _ in segment)
+        redacted = _redact_text(joined, words)
+        offset = 0
+        for idx, length in segment:
+            items[idx]["text"] = redacted[offset:offset + length]
+            offset += length
+        segment.clear()
+
+    for row in rows:
+        if row["kind"] == "gap":
+            flush_segment()
+            items.append(
+                {
+                    "kind": "gap",
+                    "seq": row["seq"],
+                    "revision": None,
+                    "text": None,
+                    "start_seq": row["start_seq"],
+                    "end_seq": row["end_seq"],
+                }
+            )
+        else:
+            text = row["effective_text"]
+            items.append(
+                {
+                    "kind": "subtitle",
+                    "seq": row["seq"],
+                    "revision": row["revision"],
+                    "text": text,
+                    "start_seq": None,
+                    "end_seq": None,
+                }
+            )
+            segment.append((len(items) - 1, len(text)))
+    flush_segment()
+    return items
+
+
+def _redact_text(text: str, words: list) -> str:
+    """在拼接文本上枚举所有词的重叠命中，覆盖区间并集逐码点替换为 *。
+
+    str.find 逐码点精确匹配：区分大小写、不做任何归一化；每次命中后从
+    命中起点 +1 处继续查找，重叠命中同样被枚举。每个被覆盖码点恰好
+    替换为一个 *，未命中码点原样保留。
+    """
+    if not text:
+        return text
+    covered = bytearray(len(text))
+    for word in words:
+        pos = text.find(word)
+        while pos >= 0:
+            covered[pos:pos + len(word)] = b"\x01" * len(word)
+            pos = text.find(word, pos + 1)
+    return "".join("*" if covered[i] else ch for i, ch in enumerate(text))
 
 
 # ---------- 命名消费者拉取游标 ----------

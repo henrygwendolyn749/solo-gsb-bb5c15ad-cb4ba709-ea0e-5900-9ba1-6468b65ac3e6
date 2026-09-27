@@ -398,6 +398,68 @@ class SnapshotDiffResponse(BaseModel):
     )
 
 
+# ---------- 快照敏感词遮盖 ----------
+
+
+class RedactionIn(BaseModel):
+    words: List[str] = Field(
+        ...,
+        description=(
+            "敏感词表：去重后须为 1~20 项，每项 1~128 个 Unicode 码点；"
+            "区分大小写、逐码点精确匹配，不做任何归一化"
+        ),
+    )
+    after: int = Field(
+        0, ge=0, description="只返回序号大于该值的条目（字幕与缺口标记统一计数）"
+    )
+    limit: int = Field(
+        100, ge=1, le=100, description="本页最多返回的条目数（1~100）"
+    )
+
+    @field_validator("words")
+    @classmethod
+    def _dedup_and_validate_words(cls, v: List[str]) -> List[str]:
+        for w in v:
+            if not 1 <= len(w) <= 128:
+                raise ValueError("每个敏感词须为 1~128 个 Unicode 码点")
+        unique = list(dict.fromkeys(v))
+        if not 1 <= len(unique) <= 20:
+            raise ValueError("敏感词表去重后须为 1~20 项")
+        return unique
+
+
+class RedactionItem(BaseModel):
+    kind: str = Field("subtitle", description="条目类型：subtitle=字幕；gap=永久缺口标记")
+    seq: int
+    revision: Optional[int] = Field(None, description="原始修订号（仅字幕条目存在）")
+    text: Optional[str] = Field(
+        None,
+        description="遮盖后的快照冻结生效文本（仅字幕条目存在）：被覆盖码点逐个替换为 *，"
+        "未命中部分原样保留",
+    )
+    start_seq: Optional[int] = Field(None, description="缺口区间起点（仅缺口条目存在）")
+    end_seq: Optional[int] = Field(None, description="缺口区间终点（仅缺口条目存在）")
+
+
+class SnapshotRedactionResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    watermark: int = Field(..., description="快照锁定的水位线，即参与遮盖计算的条目总数")
+    words: List[str] = Field(
+        ..., description="实际参与遮盖的词表（已去重，保持首次出现的输入顺序）"
+    )
+    items: List[RedactionItem] = Field(
+        ...,
+        description="本页条目（字幕返回遮盖后文本，缺口标记原样返回），按 seq 升序；"
+        "遮盖先按完整快照计算，跨页边界的词语同样完整遮盖",
+    )
+    next_after: Optional[int] = Field(
+        None,
+        description="下一页游标：本页之后仍有条目时为本页末序号，以其作为 after 续拉；"
+        "没有更多条目时为 null",
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 

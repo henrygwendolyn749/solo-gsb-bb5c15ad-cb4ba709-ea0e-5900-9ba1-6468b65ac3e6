@@ -398,6 +398,54 @@ class SnapshotDiffResponse(BaseModel):
     )
 
 
+# ---------- 快照敏感词遮盖 ----------
+
+
+class RedactionIn(BaseModel):
+    words: List[str] = Field(
+        ...,
+        description=(
+            "敏感词表：按精确相等去重（保持首次出现顺序）后须有 1~20 项，"
+            "每项 1~128 个 Unicode 码点；匹配区分大小写、逐码点精确，不做归一化"
+        ),
+    )
+    after: int = Field(
+        0, ge=0, description="只返回序号大于该值的条目（字幕与缺口统一计数）"
+    )
+    limit: int = Field(100, ge=1, le=100, description="本页最多返回的条目数（1~100）")
+
+    @field_validator("words")
+    @classmethod
+    def _dedup_and_validate_words(cls, v: List[str]) -> List[str]:
+        deduped = list(dict.fromkeys(v))
+        if not 1 <= len(deduped) <= 20:
+            raise ValueError("敏感词表按精确相等去重后须有 1~20 项")
+        for word in deduped:
+            if not 1 <= len(word) <= 128:
+                raise ValueError("每个敏感词须为 1~128 个 Unicode 码点")
+        return deduped
+
+
+class SnapshotRedactionResponse(BaseModel):
+    snapshot_id: str
+    channel: str
+    watermark: int = Field(..., description="快照锁定的水位线，也是参与遮盖计算的条目总数")
+    words: List[str] = Field(
+        ...,
+        description="实际生效的敏感词表（已按精确相等去重，保持请求中的首次出现顺序）",
+    )
+    items: List[SnapshotEffectiveItem] = Field(
+        ...,
+        description="本页遮盖结果（按 seq 升序）：字幕返回遮盖后的冻结生效文本，"
+        "缺口标记原样保留",
+    )
+    next_after: Optional[int] = Field(
+        None,
+        description="下一页游标：还有后续条目时为本页末条序号，以其作为 after 续拉；"
+        "否则为 null",
+    )
+
+
 # ---------- 命名消费者拉取游标 ----------
 
 

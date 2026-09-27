@@ -51,6 +51,18 @@
   只计差异条目，next_after 指向本页最后一条差异的 seq，稀疏差异
   也不会因中间大量未变化条目而漏项。
 
+快照敏感词遮盖（redact_snapshot）不变式：
+- 遮盖是纯只读计算：只读取 snapshot_items 中冻结的生效文本，快照表与
+  定稿 / 更正原表均不被修改；
+- 匹配在整个快照 1..watermark 上进行：相邻字幕（中间无缺口）按序号无
+  分隔拼接，缺口阻断拼接——跨字幕（含跨页）词语完整命中，跨缺口词语
+  绝不命中；
+- 匹配逐码点、区分大小写、不做归一化；所有词的重叠命中都参与，覆盖
+  区间取并集，每个被覆盖码点替换为一个 "*"（遮盖后码点数不变），再按
+  各字幕原码点长度拆回原序号；未命中文字与缺口标记原样保留；
+- 分页在遮盖完成后进行：after/limit 只决定返回哪些条目，next_after 在
+  还有后续条目时指向本页末序号，否则为 null。
+
 命名消费者拉取游标（consumers）不变式：
 - 每个 (channel, consumer) 的 cursor 只能经确认接口单调推进，且只能
   推进到当前租约批次 [lease_from, lease_to] 内的序号；
@@ -1238,6 +1250,129 @@ def _diff_side_item(row, side: str):
         "end_seq": None,
         "correction_version": row[f"{side}_correction_version"],
     }
+
+
+# ---------- 快照敏感词遮盖 ----------
+
+
+def redact_snapshot(
+    snapshot_id: str, words: list, after: int = 0, limit: int = 100
+) -> dict:
+    """对快照冻结的生效文本做敏感词遮盖，按 after/limit 分页返回（只读）。
+
+    遮盖在整个快照范围内一次算好再分页：1..watermark 的相邻字幕（中间
+    没有缺口）按序号无分隔拼接，缺口阻断拼接；在去重后的词表上逐码点、
+    区分大小写地枚举全部重叠命中，覆盖区间取并集后每个被覆盖码点替换
+    为一个 "*"（长度不变），再按各字幕原码点长度拆回原序号。快照表与
+    定稿 / 更正原表均不被修改。
+    """
+    # 防御性去重（HTTP 层 schema 已去重并校验 1~20 项、每项 1~128 码点）
+    words = list(dict.fromkeys(words))
+    with read_tx() as conn:
+        meta = _get_snapshot_meta(conn, snapshot_id)
+        channel, watermark = meta["channel"], meta["watermark"]
+        rows = conn.execute(
+            """
+            SELECT seq, kind, revision, effective_text, correction_version,
+                   start_seq, end_seq
+            FROM snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY seq
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    masked = _redact_texts(rows, words)
+
+    items = []
+    has_more = False
+    for row in rows:
+        if row["seq"] <= after:
+            continue
+        if len(items) >= limit:
+            has_more = True
+            break
+        if row["kind"] == "gap":
+            items.append(
+                {
+                    "kind": "gap",
+                    "seq": row["seq"],
+                    "revision": None,
+                    "text": None,
+                    "start_seq": row["start_seq"],
+                    "end_seq": row["end_seq"],
+                    "correction_version": None,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "kind": "subtitle",
+                    "seq": row["seq"],
+                    "revision": row["revision"],
+                    "text": masked[row["seq"]],
+                    "start_seq": None,
+                    "end_seq": None,
+                    "correction_version": row["correction_version"],
+                }
+            )
+
+    return {
+        "snapshot_id": snapshot_id,
+        "channel": channel,
+        "watermark": watermark,
+        "words": words,
+        "items": items,
+        "next_after": items[-1]["seq"] if (items and has_more) else None,
+    }
+
+
+def _redact_texts(rows: list, words: list) -> dict:
+    """按序号拼接相邻字幕并计算遮盖，返回 {seq: 遮盖后文本}。
+
+    缺口行截断当前拼接段，敏感词不会跨缺口命中。遮盖后文本与原文码点
+    数相同（每个被覆盖码点恰好换成一个 "*"），按原长度拆回各序号。
+    """
+    masked = {}
+    segment_seqs = []
+    segment_texts = []
+
+    def flush():
+        if not segment_seqs:
+            return
+        joined = _mask_text("".join(segment_texts), words)
+        pos = 0
+        for seq, text in zip(segment_seqs, segment_texts):
+            masked[seq] = joined[pos:pos + len(text)]
+            pos += len(text)
+        segment_seqs.clear()
+        segment_texts.clear()
+
+    for row in rows:
+        if row["kind"] == "gap":
+            flush()
+            continue
+        segment_seqs.append(row["seq"])
+        segment_texts.append(row["effective_text"])
+    flush()
+    return masked
+
+
+def _mask_text(text: str, words: list) -> str:
+    """把 text 中被任一敏感词覆盖的码点替换为 "*"（重叠命中取并集）。"""
+    if not text or not words:
+        return text
+    covered = [False] * len(text)
+    for word in words:
+        start = 0
+        while True:
+            index = text.find(word, start)
+            if index < 0:
+                break
+            for i in range(index, index + len(word)):
+                covered[i] = True
+            start = index + 1  # 每次只前进一步，重叠命中也被枚举
+    return "".join("*" if covered[i] else ch for i, ch in enumerate(text))
 
 
 # ---------- 命名消费者拉取游标 ----------

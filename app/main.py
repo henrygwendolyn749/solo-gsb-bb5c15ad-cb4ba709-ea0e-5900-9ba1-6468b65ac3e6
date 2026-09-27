@@ -24,11 +24,13 @@ from .schemas import (
     FragmentIn,
     GapDecisionIn,
     GapDecisionResponse,
+    RedactionIn,
     SnapshotCorrectionsResponse,
     SnapshotCreateIn,
     SnapshotDiffResponse,
     SnapshotItemsEffectiveResponse,
     SnapshotItemsResponse,
+    SnapshotRedactionResponse,
     SnapshotResponse,
     SubmitResponse,
 )
@@ -44,8 +46,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照与命名消费者拉取游标",
-    version="1.4.0",
+    "支持追加式更正、不可变发布快照、快照敏感词遮盖与命名消费者拉取游标",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -268,6 +270,32 @@ def diff_snapshots(
     以其作为下一页的 `after` 续拉；本页为空时 `next_after=null`。
     """
     return service.diff_snapshots(snapshot_id, other, after=after, limit=limit)
+
+
+@app.post(
+    "/snapshots/{snapshot_id}/redactions",
+    response_model=SnapshotRedactionResponse,
+    responses={
+        404: {"description": "快照不存在", "model": ErrorResponse},
+        422: {
+            "description": "请求体校验失败（词表去重后数量越界、词长越界、after/limit 非法）"
+        },
+    },
+)
+def redact_snapshot(snapshot_id: str, body: RedactionIn) -> dict:
+    """对快照冻结的生效文本做敏感词遮盖（只读，不修改快照或当前字幕）。
+
+    - 词表按精确相等去重后须有 1~20 项，每项 1~128 个 Unicode 码点；
+      匹配区分大小写、逐码点精确，不做归一化；
+    - 遮盖在整个快照上一次算好：相邻字幕按序号无分隔拼接，缺口阻断
+      命中；所有词的重叠命中取并集，每个被覆盖码点替换为一个 "*"，
+      再按原序号拆回；未命中文字与缺口标记原样保留；
+    - 随后返回 after 之后至多 limit 条字幕或缺口，跨页词语也完整遮盖；
+      还有后续条目时 next_after 为本页末序号，否则为 null。
+    """
+    return service.redact_snapshot(
+        snapshot_id, body.words, after=body.after, limit=body.limit
+    )
 
 
 # ---------- 命名消费者拉取游标 ----------
